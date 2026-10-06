@@ -15,9 +15,12 @@ Usage: tgforward  (runs forever; manage via systemd)
 import html
 import json
 import os
+import queue
 import re
+import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.parse
@@ -35,6 +38,62 @@ ALLOWED = set(
     if line.strip()
 )
 OFFSET_FILE = os.path.join(DIR, "data", "forward_offset.txt")
+QUEUE_FILE = os.path.join(DIR, "data", "x_queue.json")
+
+# --- X download job queue ---
+# Jobs are processed by a background worker thread. Queue persists to disk
+# so pending jobs survive restarts. Downloads use curl -C - (resume).
+x_queue = queue.Queue()
+queue_lock = threading.Lock()
+active_job = None  # currently processing job info
+
+def load_queue():
+    """Load pending jobs from disk on startup."""
+    try:
+        if os.path.isfile(QUEUE_FILE):
+            jobs = json.load(open(QUEUE_FILE))
+            for j in jobs:
+                x_queue.put(j)
+            print(f"loaded {len(jobs)} pending jobs from queue", flush=True)
+    except Exception as e:
+        print(f"queue load failed: {e}", flush=True)
+
+def save_queue():
+    """Persist pending + active jobs to disk."""
+    try:
+        with queue_lock:
+            # queue.Queue doesn't support iteration; use a list copy
+            jobs = list(x_queue.queue)
+            if active_job:
+                jobs.insert(0, active_job)
+        json.dump(jobs, open(QUEUE_FILE, "w"))
+    except Exception as e:
+        print(f"queue save failed: {e}", flush=True)
+
+def queue_status():
+    """Return (pending_count, active_info)."""
+    with queue_lock:
+        pending = x_queue.qsize()
+        active = active_job
+    return pending, active
+
+def cleanup_stale_files():
+    """Remove temp files older than 24h or orphaned (no active job)."""
+    try:
+        now = time.time()
+        for f in os.listdir(DATA_DIR):
+            fp = os.path.join(DATA_DIR, f)
+            if not os.path.isfile(fp):
+                continue
+            # keep files modified in last 24h (might be active downloads)
+            if now - os.path.getmtime(fp) < 24 * 3600:
+                continue
+            # remove stale temp files
+            if f.startswith("x_") and f.endswith(".mp4"):
+                print(f"cleaning stale file: {f}", flush=True)
+                os.remove(fp)
+    except Exception as e:
+        print(f"cleanup failed: {e}", flush=True)
 
 # X video handling
 X_URL_RE = re.compile(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/(\w+)/status/(\d+)")
@@ -444,13 +503,57 @@ def build_x_caption(tweet_url, text, author_name, author_handle, part=None):
     )
 
 
-def handle_x_link(url, msg_id, user_chat_id):
-    """Download X video and send to group. Sends live progress updates to the user.
-    Returns True if handled."""
+def queue_x_job(url, msg_id, user_chat_id):
+    """Add an X download job to the queue. Returns queue position."""
     m = X_URL_RE.search(url)
     if not m:
-        return False
+        return None
     tweet_user, tweet_id = m.group(1), m.group(2)
+    job = {
+        "url": url,
+        "msg_id": msg_id,
+        "user_chat_id": user_chat_id,
+        "tweet_user": tweet_user,
+        "tweet_id": tweet_id,
+        "added_at": time.time(),
+    }
+    x_queue.put(job)
+    save_queue()
+    pending, active = queue_status()
+    # position = pending (including this one) + (1 if active else 0)
+    pos = pending + (1 if active else 0)
+    return pos, pending
+
+def x_worker():
+    """Background worker: processes X download jobs from the queue."""
+    global active_job
+    while True:
+        try:
+            job = x_queue.get(timeout=5)
+        except queue.Empty:
+            continue
+        with queue_lock:
+            active_job = job
+        save_queue()  # persist without this job
+        try:
+            process_x_job(job["url"], job["msg_id"], job["user_chat_id"],
+                         job["tweet_user"], job["tweet_id"])
+        except Exception as e:
+            print(f"x job failed: {e}", flush=True)
+            try:
+                api("sendMessage", {
+                    "chat_id": job["user_chat_id"],
+                    "text": f"❌ 处理失败：{job['url']}\n原因：{e}"})
+            except Exception:
+                pass
+        finally:
+            with queue_lock:
+                active_job = None
+            save_queue()
+            x_queue.task_done()
+
+def process_x_job(url, msg_id, user_chat_id, tweet_user, tweet_id):
+    """Download X video and send to group. Sends live progress updates to the user."""
     tweet_url = f"https://x.com/{tweet_user}/status/{tweet_id}"
     tmp = os.path.join(DATA_DIR, f"x_{msg_id}_{tweet_id}.mp4")
 
@@ -556,11 +659,24 @@ def handle_message(msg):
         f = msg["forward_from"]
         fwd_sender = f.get("first_name", "") + (" " + f.get("last_name", "") if f.get("last_name") else "")
 
-    # X link? download the video and post it directly (no Muse involved)
+    # X link? queue for download (worker processes in background)
     text = msg.get("text") or msg.get("caption") or ""
     xm = X_URL_RE.search(text)
     if xm and not fwd_chat:
-        handle_x_link(xm.group(0), msg["message_id"], msg["chat"]["id"])
+        result = queue_x_job(xm.group(0), msg["message_id"], msg["chat"]["id"])
+        if result:
+            pos, pending = result
+            if pos == 1:
+                status = "🔗 收到 X 链接，开始解析…"
+            else:
+                status = (f"🔗 收到 X 链接，已加入队列（第 {pos} 位）\n"
+                         f"📋 队列中还有 {pending} 个任务等待处理")
+            try:
+                api("sendMessage", {
+                    "chat_id": msg["chat"]["id"],
+                    "text": f"{status}\n{xm.group(0)}"})
+            except Exception:
+                pass
         return
 
     caption = build_caption(msg, fwd_chat, fwd_msg_id, fwd_sender)
@@ -635,9 +751,24 @@ def handle_message(msg):
 
 def main():
     print(f"tgforward started, allowed users: {sorted(ALLOWED)}", flush=True)
+    # load pending jobs and clean stale files
+    load_queue()
+    cleanup_stale_files()
+    # start background worker for X downloads
+    worker = threading.Thread(target=x_worker, daemon=True)
+    worker.start()
+    print("x download worker started", flush=True)
+
+    # graceful shutdown: on SIGTERM, wait for active job to finish
+    shutdown_event = threading.Event()
+    def on_term(signum, frame):
+        print("SIGTERM received, waiting for active job...", flush=True)
+        shutdown_event.set()
+    signal.signal(signal.SIGTERM, on_term)
+
     offset = get_offset()
     backoff = 5
-    while True:
+    while not shutdown_event.is_set():
         try:
             r = api("getUpdates", {"offset": offset, "timeout": 50}, timeout=70)
             if not r.get("ok"):
@@ -659,6 +790,14 @@ def main():
             if "409" in err or "429" in err:
                 backoff = min(backoff * 2, 120)
             time.sleep(backoff)
+    # wait for worker to finish current job (up to 10 min)
+    print("waiting for worker to finish...", flush=True)
+    for _ in range(120):
+        with queue_lock:
+            if not active_job:
+                break
+        time.sleep(5)
+    print("shutdown complete", flush=True)
 
 
 if __name__ == "__main__":
