@@ -674,16 +674,16 @@ def process_x_job(url, msg_id, user_chat_id, tweet_user, tweet_id):
             caption = build_x_caption(tweet_url, text or "X视频", author_name,
                                       author_handle, part_label)
             seg_name = f"第 {i+1}/{total} 段" if total > 1 else "视频"
-            up_mid = send_prog(f"📤 {seg_name}上传中…\n{progress_bar(0)}")
+            up_mid = send_prog(f"📤 {seg_name}上传中 (1/2: 传到服务器)…\n{progress_bar(0)}")
             def on_up(pct, speed, eta, up_bytes=0, _mid=up_mid, _sn=seg_name,
                      heartbeat=None):
-                # underlying already throttles to 5s; show speed + MB
+                # phase 1: curl to local API (fast); phase 2: API to Telegram (slow)
                 if heartbeat:
-                    edit_prog(_mid, f"📤 {_sn}\n{heartbeat}")
+                    edit_prog(_mid, f"📤 {_sn}上传中 (2/2: 服务器→Telegram)…\n{heartbeat}")
                     return
                 up_mb = up_bytes / (1024*1024)
                 edit_prog(_mid,
-                          f"📤 {_sn}上传中…\n{progress_bar(pct)}\n"
+                          f"📤 {_sn}上传中 (1/2: 传到服务器)…\n{progress_bar(pct)}\n"
                           f"已上传 {up_mb:.1f}MB · 速度：{speed}　剩余：{eta}")
             if not send_video_file(p, caption, user_chat_id, up_mid, on_up):
                 ok_all = False
