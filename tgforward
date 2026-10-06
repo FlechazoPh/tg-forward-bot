@@ -153,36 +153,69 @@ def build_caption(msg, fwd_chat, fwd_msg_id, fwd_sender_name):
     return "".join(parts)
 
 
-def download_url(url, dest, retries=5, on_progress=None):
-    """Download a URL with curl, resume + retry. on_progress(pct, speed, eta)."""
+def download_url(url, dest, retries=5, on_progress=None, total_size=0):
+    """Download a URL with curl, resume + retry.
+    on_progress(pct, speed_str, eta_str). Updates every 5s with real speed."""
+    import threading
     for attempt in range(retries):
         cmd = ["curl", "-C", "-", "--retry", "3", "--retry-delay", "5",
                "-L", "-A", UA, "-o", dest, url, "--progress-bar"]
         proc = subprocess.Popen(cmd, stderr=subprocess.PIPE,
                                 text=True, bufsize=1)
+        start_t = time.time()
+        start_size = os.path.getsize(dest) if os.path.isfile(dest) else 0
         last_update = 0
-        try:
-            buf = ""
-            while True:
-                ch = proc.stderr.read(1)
-                if not ch:
+        last_size = start_size
+        stop_flag = threading.Event()
+
+        def monitor():
+            """Time-based progress updater (every 5s) with speed calc."""
+            nonlocal last_update, last_size
+            while not stop_flag.is_set():
+                time.sleep(5)
+                if stop_flag.is_set():
                     break
-                if ch == "\r":
-                    m = re.search(r"(\d+\.?\d*)%", buf)
-                    if m and on_progress:
-                        pct = float(m.group(1))
-                        now = time.time()
-                        if now - last_update > 5:
-                            last_update = now
-                            on_progress(pct, "…", "…")
-                    buf = ""
-                else:
-                    buf += ch
-                    if len(buf) > 500:
-                        buf = buf[-500:]
+                try:
+                    cur = os.path.getsize(dest) if os.path.isfile(dest) else 0
+                    now = time.time()
+                    elapsed = now - start_t
+                    # speed: bytes per second over last 5s window
+                    speed_bps = (cur - last_size) / 5 if elapsed > 0 else 0
+                    # overall average speed
+                    avg_bps = (cur - start_size) / elapsed if elapsed > 0 else 0
+                    # use the more stable avg for display, but show current too
+                    spd = avg_bps if avg_bps > 0 else speed_bps
+                    if spd > 1024*1024:
+                        spd_s = f"{spd/1024/1024:.1f} MB/s"
+                    elif spd > 1024:
+                        spd_s = f"{spd/1024:.0f} KB/s"
+                    else:
+                        spd_s = f"{spd:.0f} B/s"
+                    pct = (cur / total_size * 100) if total_size > 0 else 0
+                    # ETA
+                    if spd > 0 and total_size > 0 and cur < total_size:
+                        eta_s = int((total_size - cur) / spd)
+                        eta = f"{eta_s//60}分{eta_s%60}秒" if eta_s >= 60 else f"{eta_s}秒"
+                    else:
+                        eta = "…"
+                    if on_progress:
+                        on_progress(pct, spd_s, eta)
+                    last_size = cur
+                    last_update = now
+                except Exception:
+                    pass
+
+        mon = threading.Thread(target=monitor, daemon=True)
+        mon.start()
+        try:
+            # drain stderr to prevent pipe block (progress bar goes here)
+            while proc.stderr.read(1):
+                pass
         except Exception:
             pass
         proc.wait()
+        stop_flag.set()
+        mon.join(timeout=6)
         if proc.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
             return dest
         time.sleep(min(2 ** attempt, 30))
@@ -366,12 +399,17 @@ def api_upload_with_progress(method, params, files, on_progress, timeout=1800):
                     now = time.time()
                     if now - last_update > 5:  # throttle to every 5s
                         last_update = now
-                        # try to extract speed and eta from the bar
-                        parts = buf.split()
+                        # try to extract speed (e.g. "5.2M/s", "823k/s") and ETA
+                        # from curl progress bar
                         speed = eta = "…"
-                        for i, p in enumerate(parts):
-                            if p.endswith("/s") or "M" in p or "k" in p:
-                                pass
+                        # speed pattern: number + optional decimal + unit + /s
+                        sm = re.search(r"(\d+\.?\d*[kMGT]?/s)", buf)
+                        if sm:
+                            speed = sm.group(1)
+                        # ETA is usually the last time-like token
+                        em = re.findall(r"(\d+:\d+(?::\d+)?)", buf)
+                        if em:
+                            eta = em[-1]
                         on_progress(pct, speed, eta)
                 buf = ""
             else:
@@ -446,16 +484,14 @@ def handle_x_link(url, msg_id, user_chat_id):
         except Exception:
             size_mb = None
         size_hint = f"约 {size_mb}MB" if size_mb else "大小未知"
+        total_bytes = int(mm.group(1)) if mm else 0
         say(f"✅ 解析成功：{author_name} @{author_handle}")
         dl_mid = send_prog(f"⬇️ 下载中… 0%\n{size_hint} · 1080p")
-        last_dl = [0]
         def on_dl(pct, speed, eta):
-            # throttle: only edit on 5% steps to avoid flood limits
-            if pct - last_dl[0] >= 5 or pct >= 100:
-                last_dl[0] = pct
-                edit_prog(dl_mid,
-                          f"⬇️ 下载中… {pct:.0f}%\n{size_hint} · 1080p")
-        download_url(best_url, tmp, on_progress=on_dl)
+            # monitor thread already throttles to every 5s; show speed
+            edit_prog(dl_mid,
+                      f"⬇️ 下载中… {pct:.1f}%\n{size_hint} · {speed} · 剩余{eta}")
+        download_url(best_url, tmp, on_progress=on_dl, total_size=total_bytes)
         edit_prog(dl_mid, f"⬇️ 下载完成 ✅\n{size_hint} · 1080p")
         actual_mb = os.path.getsize(tmp) // (1024 * 1024)
         parts = split_video(tmp)
@@ -469,11 +505,9 @@ def handle_x_link(url, msg_id, user_chat_id):
                                       author_handle, part_label)
             seg_name = f"第 {i+1}/{total} 段" if total > 1 else "视频"
             up_mid = send_prog(f"📤 {seg_name}上传中… 0%")
-            last_up = [0]
-            def on_up(pct, speed, eta, _lm=last_up, _mid=up_mid, _sn=seg_name):
-                if pct - _lm[0] >= 5 or pct >= 100:
-                    _lm[0] = pct
-                    edit_prog(_mid, f"📤 {_sn}上传中… {pct:.0f}%")
+            def on_up(pct, speed, eta, _mid=up_mid, _sn=seg_name):
+                # underlying already throttles to 5s; show speed
+                edit_prog(_mid, f"📤 {_sn}上传中… {pct:.1f}%\n速度：{speed}　剩余：{eta}")
             if not send_video_file(p, caption, user_chat_id, up_mid, on_up):
                 ok_all = False
                 edit_prog(up_mid, f"📤 {seg_name}上传失败 ❌")
