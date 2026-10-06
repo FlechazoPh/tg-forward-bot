@@ -190,36 +190,53 @@ def download_url(url, dest, retries=5, on_progress=None):
 
 
 def fx_best_video(tweet_user, tweet_id):
-    """Query fxtwitter API, return (best_mp4_url, author_name, author_handle, text)."""
-    api_url = f"{FX_API}/{tweet_user}/status/{tweet_id}"
-    # use curl (not urllib): urllib's proxy handling breaks TLS here
-    out = subprocess.run(
-        ["curl", "-s", "-m", "30", "-A", UA, api_url],
-        capture_output=True, text=True, timeout=40).stdout
-    d = json.loads(out)
-    if d.get("code") != 200:
-        raise RuntimeError(f"fxtwitter API error: {d.get('code')}")
-    t = d["tweet"]
-    author = t.get("author", {})
-    videos = (t.get("media") or {}).get("videos") or []
-    if not videos:
-        raise RuntimeError("no video in tweet")
-    best_url, best_res = None, 0
-    for fmt in videos[0].get("formats", []):
-        url = fmt.get("url", "")
-        if not url.endswith(".mp4") and ".mp4?" not in url:
+    """Query fxtwitter API (fallback: vxtwitter), return (best_mp4_url, ...)."""
+    last_err = None
+    for base in (FX_API, "https://api.vxtwitter.com"):
+        api_url = f"{base}/{tweet_user}/status/{tweet_id}"
+        # use curl (not urllib): urllib's proxy handling breaks TLS here
+        r = subprocess.run(
+            ["curl", "-s", "-m", "30", "-A", UA, "-w", "\n%{http_code}",
+             api_url],
+            capture_output=True, text=True, timeout=40)
+        out = r.stdout.strip()
+        lines = out.rsplit("\n", 1)
+        body, code = (lines[0], lines[1]) if len(lines) == 2 else ("", "")
+        if r.returncode != 0 or code != "200" or not body:
+            last_err = (f"{base} failed: rc={r.returncode} http={code} "
+                        f"err={r.stderr[:80]}")
+            print(f"[x:{tweet_id}] {last_err}, trying fallback", flush=True)
             continue
-        m = re.search(r"/(\d+)x(\d+)/", url)
-        if m:
-            res = int(m.group(1)) * int(m.group(2))
-            if res > best_res:
-                best_res, best_url = res, url
-    if not best_url:
-        raise RuntimeError("no mp4 format found")
-    return (best_url,
-            author.get("name", tweet_user),
-            author.get("screen_name", tweet_user),
-            t.get("text", ""))
+        try:
+            d = json.loads(body)
+        except Exception as e:
+            last_err = f"{base} bad JSON: {e}"
+            continue
+        if d.get("code") != 200:
+            last_err = f"{base} API code={d.get('code')}"
+            continue
+        t = d["tweet"]
+        author = t.get("author", {})
+        videos = (t.get("media") or {}).get("videos") or []
+        if not videos:
+            raise RuntimeError("no video in tweet")
+        best_url, best_res = None, 0
+        for fmt in videos[0].get("formats", []):
+            url = fmt.get("url", "")
+            if not url.endswith(".mp4") and ".mp4?" not in url:
+                continue
+            m = re.search(r"/(\d+)x(\d+)/", url)
+            if m:
+                res = int(m.group(1)) * int(m.group(2))
+                if res > best_res:
+                    best_res, best_url = res, url
+        if not best_url:
+            raise RuntimeError("no mp4 format found")
+        return (best_url,
+                author.get("name", tweet_user),
+                author.get("screen_name", tweet_user),
+                t.get("text", ""))
+    raise RuntimeError(last_err or "all APIs failed")
 
 
 def split_video(path, max_bytes=MAX_TG_FILE):
