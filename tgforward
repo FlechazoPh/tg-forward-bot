@@ -515,16 +515,33 @@ def api_upload_with_progress(method, params, files, on_progress, timeout=1800):
     upload_done = threading.Event()
     heartbeat_start = time.time()
     def heartbeat():
-        while not heartbeat_stop.wait(15):
+        # Phase 2: Server -> Telegram. No real progress available from Bot API,
+        # so estimate based on elapsed time and typical TG upload speed (~3 MB/s).
+        # This gives user a sense of progress vs. stuck.
+        EST_SPEED = 3 * 1024 * 1024  # 3 MB/s estimate
+        while not heartbeat_stop.wait(10):
             if upload_done.is_set():
                 break
-            elapsed = int(time.time() - heartbeat_start)
-            em = f"{elapsed//60}分{elapsed%60}秒" if elapsed >= 60 else f"{elapsed}秒"
+            elapsed = time.time() - heartbeat_start
+            est_bytes = min(int(elapsed * EST_SPEED), total_bytes)
+            est_pct = (est_bytes / total_bytes * 100) if total_bytes else 0
+            em = f"{int(elapsed)//60}分{int(elapsed)%60}秒" if elapsed >= 60 else f"{int(elapsed)}秒"
+            est_mb = est_bytes / (1024*1024)
+            total_mb = total_bytes / (1024*1024)
+            # estimated remaining
+            if EST_SPEED > 0 and est_bytes < total_bytes:
+                rem_s = int((total_bytes - est_bytes) / EST_SPEED)
+                rem = f"{rem_s//60}分{rem_s%60}秒" if rem_s >= 60 else f"{rem_s}秒"
+            else:
+                rem = "…"
             try:
-                on_progress(100, "…", "…", total_bytes,
-                           heartbeat=f"⏳ 已上传到服务器，等待 Telegram 处理… (已等待{em})")
+                on_progress(est_pct, "~3.0 MB/s (估算)", rem, est_bytes,
+                           heartbeat=f"📤 上传中 (2/2: 服务器→Telegram)…\n"
+                           f"{progress_bar(est_pct)}\n"
+                           f"已上传约 {est_mb:.1f}MB / {total_mb:.1f}MB · "
+                           f"~3.0 MB/s (估算) · 已用时{em} · 预计剩余{rem}")
             except TypeError:
-                pass  # old callback signature
+                pass
     hb = threading.Thread(target=heartbeat, daemon=True)
     hb.start()
     out, _ = proc.communicate()
@@ -677,9 +694,11 @@ def process_x_job(url, msg_id, user_chat_id, tweet_user, tweet_id):
             up_mid = send_prog(f"📤 {seg_name}上传中 (1/2: 传到服务器)…\n{progress_bar(0)}")
             def on_up(pct, speed, eta, up_bytes=0, _mid=up_mid, _sn=seg_name,
                      heartbeat=None):
-                # phase 1: curl to local API (fast); phase 2: API to Telegram (slow)
+                # phase 1: curl to local API (real progress)
+                # phase 2: API to Telegram (estimated progress via heartbeat)
                 if heartbeat:
-                    edit_prog(_mid, f"📤 {_sn}上传中 (2/2: 服务器→Telegram)…\n{heartbeat}")
+                    # heartbeat already contains full formatted message
+                    edit_prog(_mid, heartbeat)
                     return
                 up_mb = up_bytes / (1024*1024)
                 edit_prog(_mid,
