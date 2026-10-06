@@ -570,6 +570,13 @@ def queue_x_job(url, msg_id, user_chat_id):
     if not m:
         return None
     tweet_user, tweet_id = m.group(1), m.group(2)
+    # Deduplicate: skip if same tweet_id already in queue or being processed
+    with queue_lock:
+        queued_ids = {j["tweet_id"] for j in list(x_queue.queue)}
+        if active_job and active_job.get("tweet_id") == tweet_id:
+            return None  # already processing
+        if tweet_id in queued_ids:
+            return None  # already queued
     job = {
         "url": url,
         "msg_id": msg_id,
@@ -762,6 +769,14 @@ def handle_message(msg):
                 api("sendMessage", {
                     "chat_id": msg["chat"]["id"],
                     "text": f"{status}\n{xm.group(0)}"})
+            except Exception:
+                pass
+        else:
+            # Duplicate link already in queue/processing
+            try:
+                api("sendMessage", {
+                    "chat_id": msg["chat"]["id"],
+                    "text": f"🔗 该链接已在队列中，跳过重复添加\n{xm.group(0)}"})
             except Exception:
                 pass
         return
