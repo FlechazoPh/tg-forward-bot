@@ -153,6 +153,14 @@ def build_caption(msg, fwd_chat, fwd_msg_id, fwd_sender_name):
     return "".join(parts)
 
 
+def progress_bar(pct, width=20):
+    """Generate a text progress bar: [██████████░░░░░░░░░░] 50%"""
+    pct = max(0, min(100, pct))
+    filled = int(width * pct / 100)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"[{bar}] {pct:.0f}%"
+
+
 def download_url(url, dest, retries=5, on_progress=None, total_size=0):
     """Download a URL with curl, resume + retry.
     on_progress(pct, speed_str, eta_str). Updates every 5s with real speed."""
@@ -355,7 +363,7 @@ def send_video_file(path, caption, user_chat_id=None, progress_msg_id=None,
             files["thumb"] = thumb
         # upload with progress parsing
         cb = on_progress or (lambda pct, speed, eta: edit_progress(
-            f"📤 上传中… {pct:.0f}%\n速度：{speed}　剩余：{eta}"))
+            f"📤 上传中…\n{progress_bar(pct)}\n速度：{speed}　剩余：{eta}"))
         r = api_upload_with_progress("sendVideo", params, files, cb, timeout=1800)
         if r.get("ok"):
             return True
@@ -486,11 +494,11 @@ def handle_x_link(url, msg_id, user_chat_id):
         size_hint = f"约 {size_mb}MB" if size_mb else "大小未知"
         total_bytes = int(mm.group(1)) if mm else 0
         say(f"✅ 解析成功：{author_name} @{author_handle}")
-        dl_mid = send_prog(f"⬇️ 下载中… 0%\n{size_hint} · 1080p")
+        dl_mid = send_prog(f"⬇️ 下载中…\n{progress_bar(0)}\n{size_hint} · 1080p")
         def on_dl(pct, speed, eta):
             # monitor thread already throttles to every 5s; show speed
             edit_prog(dl_mid,
-                      f"⬇️ 下载中… {pct:.1f}%\n{size_hint} · {speed} · 剩余{eta}")
+                      f"⬇️ 下载中…\n{progress_bar(pct)}\n{size_hint} · {speed} · 剩余{eta}")
         download_url(best_url, tmp, on_progress=on_dl, total_size=total_bytes)
         edit_prog(dl_mid, f"⬇️ 下载完成 ✅\n{size_hint} · 1080p")
         actual_mb = os.path.getsize(tmp) // (1024 * 1024)
@@ -504,10 +512,10 @@ def handle_x_link(url, msg_id, user_chat_id):
             caption = build_x_caption(tweet_url, text or "X视频", author_name,
                                       author_handle, part_label)
             seg_name = f"第 {i+1}/{total} 段" if total > 1 else "视频"
-            up_mid = send_prog(f"📤 {seg_name}上传中… 0%")
+            up_mid = send_prog(f"📤 {seg_name}上传中…\n{progress_bar(0)}")
             def on_up(pct, speed, eta, _mid=up_mid, _sn=seg_name):
                 # underlying already throttles to 5s; show speed
-                edit_prog(_mid, f"📤 {_sn}上传中… {pct:.1f}%\n速度：{speed}　剩余：{eta}")
+                edit_prog(_mid, f"📤 {_sn}上传中…\n{progress_bar(pct)}\n速度：{speed}　剩余：{eta}")
             if not send_video_file(p, caption, user_chat_id, up_mid, on_up):
                 ok_all = False
                 edit_prog(up_mid, f"📤 {seg_name}上传失败 ❌")
