@@ -266,7 +266,7 @@ def download_url(url, dest, retries=5, on_progress=None, total_size=0):
                     else:
                         eta = "…"
                     if on_progress:
-                        on_progress(pct, spd_s, eta)
+                        on_progress(pct, spd_s, eta, cur)
                     last_size = cur
                     last_update = now
                 except Exception:
@@ -421,8 +421,9 @@ def send_video_file(path, caption, user_chat_id=None, progress_msg_id=None,
         if thumb and os.path.isfile(thumb):
             files["thumb"] = thumb
         # upload with progress parsing
-        cb = on_progress or (lambda pct, speed, eta: edit_progress(
-            f"📤 上传中…\n{progress_bar(pct)}\n速度：{speed}　剩余：{eta}"))
+        cb = on_progress or (lambda pct, speed, eta, up_bytes=0: edit_progress(
+            f"📤 上传中…\n{progress_bar(pct)}\n"
+            f"已上传 {up_bytes/(1024*1024):.1f}MB · 速度：{speed}　剩余：{eta}"))
         r = api_upload_with_progress("sendVideo", params, files, cb, timeout=1800)
         if r.get("ok"):
             return True
@@ -437,9 +438,15 @@ def send_video_file(path, caption, user_chat_id=None, progress_msg_id=None,
 
 
 def api_upload_with_progress(method, params, files, on_progress, timeout=1800):
-    """POST multipart via curl, parse progress bar, call on_progress(pct, speed, eta)."""
+    """POST multipart via curl, parse progress bar.
+    on_progress(pct, speed, eta, uploaded_bytes)."""
     token = TOKEN
     url = f"{API}/bot{token}/{method}"
+    # total size for MB calculation
+    total_bytes = 0
+    for path in files.values():
+        if os.path.isfile(path):
+            total_bytes += os.path.getsize(path)
     cmd = ["curl", "-s", "-m", str(timeout), url]
     for k, v in params.items():
         cmd += ["--form-string", f"{k}={v}"]
@@ -477,7 +484,12 @@ def api_upload_with_progress(method, params, files, on_progress, timeout=1800):
                         em = re.findall(r"(\d+:\d+(?::\d+)?)", buf)
                         if em:
                             eta = em[-1]
-                        on_progress(pct, speed, eta)
+                        uploaded = int(total_bytes * pct / 100) if total_bytes else 0
+                        try:
+                            on_progress(pct, speed, eta, uploaded)
+                        except TypeError:
+                            # backward compat for 3-arg callbacks
+                            on_progress(pct, speed, eta)
                 buf = ""
             else:
                 buf += ch
@@ -571,10 +583,15 @@ def process_x_job(url, msg_id, user_chat_id, tweet_user, tweet_id):
         if not mid:
             return
         try:
-            api("editMessageText", {
+            r = api("editMessageText", {
                 "chat_id": user_chat_id, "message_id": mid, "text": text})
-        except Exception:
-            pass
+            if not r.get("ok"):
+                # log failures (e.g. message not modified, flood control)
+                desc = r.get("description", "")[:80]
+                if "not modified" not in desc:
+                    print(f"[x:{tweet_id}] edit_prog failed: {desc}", flush=True)
+        except Exception as e:
+            print(f"[x:{tweet_id}] edit_prog error: {e}", flush=True)
 
     def say(text):
         print(f"[x:{tweet_id}] {text}", flush=True)
@@ -598,10 +615,12 @@ def process_x_job(url, msg_id, user_chat_id, tweet_user, tweet_id):
         total_bytes = int(mm.group(1)) if mm else 0
         say(f"✅ 解析成功：{author_name} @{author_handle}")
         dl_mid = send_prog(f"⬇️ 下载中…\n{progress_bar(0)}\n{size_hint} · 1080p")
-        def on_dl(pct, speed, eta):
-            # monitor thread already throttles to every 5s; show speed
+        def on_dl(pct, speed, eta, cur_bytes=0):
+            # monitor thread already throttles to every 5s; show speed + MB
+            cur_mb = cur_bytes / (1024*1024)
             edit_prog(dl_mid,
-                      f"⬇️ 下载中…\n{progress_bar(pct)}\n{size_hint} · {speed} · 剩余{eta}")
+                      f"⬇️ 下载中…\n{progress_bar(pct)}\n"
+                      f"已下载 {cur_mb:.1f}MB / {size_hint} · {speed} · 剩余{eta}")
         download_url(best_url, tmp, on_progress=on_dl, total_size=total_bytes)
         edit_prog(dl_mid, f"⬇️ 下载完成 ✅\n{size_hint} · 1080p")
         actual_mb = os.path.getsize(tmp) // (1024 * 1024)
@@ -616,9 +635,12 @@ def process_x_job(url, msg_id, user_chat_id, tweet_user, tweet_id):
                                       author_handle, part_label)
             seg_name = f"第 {i+1}/{total} 段" if total > 1 else "视频"
             up_mid = send_prog(f"📤 {seg_name}上传中…\n{progress_bar(0)}")
-            def on_up(pct, speed, eta, _mid=up_mid, _sn=seg_name):
-                # underlying already throttles to 5s; show speed
-                edit_prog(_mid, f"📤 {_sn}上传中…\n{progress_bar(pct)}\n速度：{speed}　剩余：{eta}")
+            def on_up(pct, speed, eta, up_bytes=0, _mid=up_mid, _sn=seg_name):
+                # underlying already throttles to 5s; show speed + MB
+                up_mb = up_bytes / (1024*1024)
+                edit_prog(_mid,
+                          f"📤 {_sn}上传中…\n{progress_bar(pct)}\n"
+                          f"已上传 {up_mb:.1f}MB · 速度：{speed}　剩余：{eta}")
             if not send_video_file(p, caption, user_chat_id, up_mid, on_up):
                 ok_all = False
                 edit_prog(up_mid, f"📤 {seg_name}上传失败 ❌")
