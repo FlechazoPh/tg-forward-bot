@@ -98,7 +98,7 @@ def cleanup_stale_files():
 # X video handling
 X_URL_RE = re.compile(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/(\w+)/status/(\d+)")
 FX_API = "https://api.fxtwitter.com"
-MAX_TG_FILE = 1900 * 1024 * 1024  # split threshold (under the 2000MB Bot API limit)
+MAX_TG_FILE = 800 * 1024 * 1024  # split threshold: 800MB (avoid OOM on 8GB server)
 UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15"
 
 
