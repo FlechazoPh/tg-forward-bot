@@ -236,21 +236,26 @@ def download_url(url, dest, retries=5, on_progress=None, total_size=0):
         stop_flag = threading.Event()
 
         def monitor():
-            """Time-based progress updater (every 5s) with speed calc."""
+            """Progress updater: every 3s, or immediately if MB changed.
+            Shows real-time MB so user knows download is alive."""
             nonlocal last_update, last_size
+            last_mb = -1
             while not stop_flag.is_set():
-                time.sleep(5)
+                time.sleep(2)
                 if stop_flag.is_set():
                     break
                 try:
                     cur = os.path.getsize(dest) if os.path.isfile(dest) else 0
+                    cur_mb = cur / (1024*1024)
                     now = time.time()
+                    # update if MB changed or 5s elapsed (heartbeat)
+                    mb_changed = int(cur_mb) != int(last_mb)
+                    time_elapsed = now - last_update >= 5
+                    if not (mb_changed or time_elapsed):
+                        continue
                     elapsed = now - start_t
-                    # speed: bytes per second over last 5s window
-                    speed_bps = (cur - last_size) / 5 if elapsed > 0 else 0
-                    # overall average speed
+                    speed_bps = (cur - last_size) / max(now - last_update, 0.1)
                     avg_bps = (cur - start_size) / elapsed if elapsed > 0 else 0
-                    # use the more stable avg for display, but show current too
                     spd = avg_bps if avg_bps > 0 else speed_bps
                     if spd > 1024*1024:
                         spd_s = f"{spd/1024/1024:.1f} MB/s"
@@ -259,7 +264,6 @@ def download_url(url, dest, retries=5, on_progress=None, total_size=0):
                     else:
                         spd_s = f"{spd:.0f} B/s"
                     pct = (cur / total_size * 100) if total_size > 0 else 0
-                    # ETA
                     if spd > 0 and total_size > 0 and cur < total_size:
                         eta_s = int((total_size - cur) / spd)
                         eta = f"{eta_s//60}分{eta_s%60}秒" if eta_s >= 60 else f"{eta_s}秒"
@@ -269,6 +273,7 @@ def download_url(url, dest, retries=5, on_progress=None, total_size=0):
                         on_progress(pct, spd_s, eta, cur)
                     last_size = cur
                     last_update = now
+                    last_mb = cur_mb
                 except Exception:
                     pass
 
@@ -421,9 +426,10 @@ def send_video_file(path, caption, user_chat_id=None, progress_msg_id=None,
         if thumb and os.path.isfile(thumb):
             files["thumb"] = thumb
         # upload with progress parsing
-        cb = on_progress or (lambda pct, speed, eta, up_bytes=0: edit_progress(
+        cb = on_progress or (lambda pct, speed, eta, up_bytes=0, heartbeat=None: edit_progress(
             f"📤 上传中…\n{progress_bar(pct)}\n"
-            f"已上传 {up_bytes/(1024*1024):.1f}MB · 速度：{speed}　剩余：{eta}"))
+            f"已上传 {up_bytes/(1024*1024):.1f}MB · 速度：{speed}　剩余：{eta}"
+            if not heartbeat else f"📤\n{heartbeat}"))
         r = api_upload_with_progress("sendVideo", params, files, cb, timeout=1800)
         if r.get("ok"):
             mid = (r.get("result") or {}).get("message_id")
@@ -441,7 +447,10 @@ def send_video_file(path, caption, user_chat_id=None, progress_msg_id=None,
 
 def api_upload_with_progress(method, params, files, on_progress, timeout=1800):
     """POST multipart via curl, parse progress bar.
-    on_progress(pct, speed, eta, uploaded_bytes)."""
+    on_progress(pct, speed, eta, uploaded_bytes).
+    After curl finishes uploading to local API, shows heartbeat while
+    waiting for Telegram to process (can take minutes for large files)."""
+    import threading
     token = TOKEN
     url = f"{API}/bot{token}/{method}"
     # total size for MB calculation
@@ -499,7 +508,28 @@ def api_upload_with_progress(method, params, files, on_progress, timeout=1800):
                     buf = buf[-500:]
     except Exception:
         pass
+    # Start heartbeat thread: if curl finishes upload but API hasn't
+    # responded (Telegram processing large file), update every 15s
+    # with elapsed time so user knows it's not stuck.
+    heartbeat_stop = threading.Event()
+    upload_done = threading.Event()
+    heartbeat_start = time.time()
+    def heartbeat():
+        while not heartbeat_stop.wait(15):
+            if upload_done.is_set():
+                break
+            elapsed = int(time.time() - heartbeat_start)
+            em = f"{elapsed//60}分{elapsed%60}秒" if elapsed >= 60 else f"{elapsed}秒"
+            try:
+                on_progress(100, "…", "…", total_bytes,
+                           heartbeat=f"⏳ 已上传到服务器，等待 Telegram 处理… (已等待{em})")
+            except TypeError:
+                pass  # old callback signature
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    hb.start()
     out, _ = proc.communicate()
+    upload_done.set()
+    heartbeat_stop.set()
     try:
         return json.loads(out)
     except Exception:
@@ -591,15 +621,17 @@ def process_x_job(url, msg_id, user_chat_id, tweet_user, tweet_id):
         if not mid:
             return
         try:
+            # use short timeout for progress updates (fail fast, don't block)
             r = api("editMessageText", {
-                "chat_id": user_chat_id, "message_id": mid, "text": text})
+                "chat_id": user_chat_id, "message_id": mid, "text": text},
+                timeout=10)
             if not r.get("ok"):
-                # log failures (e.g. message not modified, flood control)
                 desc = r.get("description", "")[:80]
                 if "not modified" not in desc:
                     print(f"[x:{tweet_id}] edit_prog failed: {desc}", flush=True)
         except Exception as e:
-            print(f"[x:{tweet_id}] edit_prog error: {e}", flush=True)
+            # timeout or other error - log but don't block
+            print(f"[x:{tweet_id}] edit_prog error: {str(e)[:60]}", flush=True)
 
     def say(text):
         print(f"[x:{tweet_id}] {text}", flush=True)
@@ -643,8 +675,12 @@ def process_x_job(url, msg_id, user_chat_id, tweet_user, tweet_id):
                                       author_handle, part_label)
             seg_name = f"第 {i+1}/{total} 段" if total > 1 else "视频"
             up_mid = send_prog(f"📤 {seg_name}上传中…\n{progress_bar(0)}")
-            def on_up(pct, speed, eta, up_bytes=0, _mid=up_mid, _sn=seg_name):
+            def on_up(pct, speed, eta, up_bytes=0, _mid=up_mid, _sn=seg_name,
+                     heartbeat=None):
                 # underlying already throttles to 5s; show speed + MB
+                if heartbeat:
+                    edit_prog(_mid, f"📤 {_sn}\n{heartbeat}")
+                    return
                 up_mb = up_bytes / (1024*1024)
                 edit_prog(_mid,
                           f"📤 {_sn}上传中…\n{progress_bar(pct)}\n"
@@ -695,12 +731,14 @@ def handle_message(msg):
     if xm and not fwd_chat:
         result = queue_x_job(xm.group(0), msg["message_id"], msg["chat"]["id"])
         if result:
-            pos, pending = result
-            if pos == 1:
+            pos, _ = result
+            pending, active = queue_status()
+            total = pending + (1 if active else 0)
+            if pos == 1 and not active:
                 status = "🔗 收到 X 链接，开始解析…"
             else:
-                status = (f"🔗 收到 X 链接，已加入队列（第 {pos} 位）\n"
-                         f"📋 队列中还有 {pending} 个任务等待处理")
+                # (x/y): x=position in queue, y=total jobs
+                status = f"🔗 收到 X 链接，已加入队列 ({pos}/{total})"
             try:
                 api("sendMessage", {
                     "chat_id": msg["chat"]["id"],
