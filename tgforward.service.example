@@ -1,0 +1,13 @@
+[Unit]
+Description=Telegram forward-to-group bot daemon
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+ExecStart=/path/to/tg-forward-bot/tgforward
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

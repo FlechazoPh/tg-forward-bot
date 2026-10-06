@@ -1,0 +1,7 @@
+.bot_token
+.api_creds
+.chat_id
+.allowed_users
+data/
+*.log
+__pycache__/
