@@ -15,6 +15,7 @@ Usage: tgforward  (runs forever; manage via systemd)
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -34,6 +35,12 @@ ALLOWED = set(
     if line.strip()
 )
 OFFSET_FILE = os.path.join(DIR, "data", "forward_offset.txt")
+
+# X video handling
+X_URL_RE = re.compile(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/(\w+)/status/(\d+)")
+FX_API = "https://api.fxtwitter.com"
+MAX_TG_FILE = 1900 * 1024 * 1024  # split threshold (under the 2000MB Bot API limit)
+UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15"
 
 
 def api(method, params=None, files=None, timeout=120):
@@ -146,6 +153,178 @@ def build_caption(msg, fwd_chat, fwd_msg_id, fwd_sender_name):
     return "".join(parts)
 
 
+def download_url(url, dest, retries=5):
+    """Download a URL with curl, resume + retry."""
+    for attempt in range(retries):
+        r = subprocess.run(
+            ["curl", "-C", "-", "--retry", "3", "--retry-delay", "5",
+             "-L", "-A", UA, "-o", dest, url],
+            capture_output=True, text=True, timeout=1800)
+        if r.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+            return dest
+        time.sleep(min(2 ** attempt, 30))
+    raise RuntimeError(f"download failed after {retries} attempts: {url[:80]}")
+
+
+def fx_best_video(tweet_user, tweet_id):
+    """Query fxtwitter API, return (best_mp4_url, author_name, author_handle, text)."""
+    api_url = f"{FX_API}/{tweet_user}/status/{tweet_id}"
+    # use curl (not urllib): urllib's proxy handling breaks TLS here
+    out = subprocess.run(
+        ["curl", "-s", "-m", "30", "-A", UA, api_url],
+        capture_output=True, text=True, timeout=40).stdout
+    d = json.loads(out)
+    if d.get("code") != 200:
+        raise RuntimeError(f"fxtwitter API error: {d.get('code')}")
+    t = d["tweet"]
+    author = t.get("author", {})
+    videos = (t.get("media") or {}).get("videos") or []
+    if not videos:
+        raise RuntimeError("no video in tweet")
+    best_url, best_res = None, 0
+    for fmt in videos[0].get("formats", []):
+        url = fmt.get("url", "")
+        if not url.endswith(".mp4") and ".mp4?" not in url:
+            continue
+        m = re.search(r"/(\d+)x(\d+)/", url)
+        if m:
+            res = int(m.group(1)) * int(m.group(2))
+            if res > best_res:
+                best_res, best_url = res, url
+    if not best_url:
+        raise RuntimeError("no mp4 format found")
+    return (best_url,
+            author.get("name", tweet_user),
+            author.get("screen_name", tweet_user),
+            t.get("text", ""))
+
+
+def split_video(path, max_bytes=MAX_TG_FILE):
+    """Split a video into <max_bytes parts (no re-encode). Returns [paths]."""
+    if os.path.getsize(path) <= max_bytes:
+        return [path]
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", path],
+        capture_output=True, text=True, check=True).stdout
+    dur = float(out.strip())
+    # estimate number of parts by size
+    n = int(os.path.getsize(path) // max_bytes) + 1
+    seg = dur / n
+    parts = []
+    base, ext = os.path.splitext(path)
+    for i in range(n):
+        p = f"{base}_p{i+1}of{n}{ext}"
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-ss", str(seg * i),
+             "-i", path, "-c", "copy", "-t", str(seg), p],
+            check=True)
+        parts.append(p)
+    return parts
+
+
+def send_video_file(path, caption):
+    """Send a video file to the target group. Returns True on success."""
+    w, h, dur = ffprobe_video(path)
+    for attempt in range(3):
+        r = api("sendVideo", {
+            "chat_id": TARGET_CHAT,
+            "parse_mode": "HTML",
+            "supports_streaming": "true",
+            "width": w, "height": h, "duration": dur,
+            "caption": caption[:1024],
+        }, files={"video": path}, timeout=1800)
+        if r.get("ok"):
+            return True
+        desc = str(r.get("description", ""))
+        ra = (r.get("parameters") or {}).get("retry_after")
+        if "retry_after" in desc or ra:
+            time.sleep((ra or 30) + 2)
+            continue
+        print(f"sendVideo failed: {r}", flush=True)
+        time.sleep(5)
+    return False
+
+
+def build_x_caption(tweet_url, text, author_name, author_handle, part=None):
+    handle_tag = author_handle.lstrip("@")
+    name_tag = "".join(author_name.split())
+    suffix = f" ({part})" if part else ""
+    return (
+        f'<a href="{html.escape(tweet_url, quote=True)}">{html.escape(text)}</a>{suffix}'
+        f'\n\n博主：{html.escape(author_name)} @{html.escape(handle_tag)}'
+        f'\n#{handle_tag} #{name_tag} #X视频下载'
+    )
+
+
+def handle_x_link(url, msg_id, user_chat_id):
+    """Download X video and send to group. Sends progress updates to the user.
+    Returns True if handled."""
+    m = X_URL_RE.search(url)
+    if not m:
+        return False
+    tweet_user, tweet_id = m.group(1), m.group(2)
+    tweet_url = f"https://x.com/{tweet_user}/status/{tweet_id}"
+    tmp = os.path.join(DATA_DIR, f"x_{msg_id}_{tweet_id}.mp4")
+
+    def progress(text):
+        print(f"[x:{tweet_id}] {text}", flush=True)
+        try:
+            api("sendMessage", {"chat_id": user_chat_id, "text": text})
+        except Exception:
+            pass
+
+    try:
+        progress(f"🔗 收到 X 链接，开始解析…\n{tweet_url}")
+        best_url, author_name, author_handle, text = fx_best_video(tweet_user, tweet_id)
+        # probe remote size for the progress message
+        try:
+            hr = subprocess.run(
+                ["curl", "-sI", "-m", "20", "-A", UA, best_url],
+                capture_output=True, text=True, timeout=25).stdout
+            mm = re.search(r"content-length:\s*(\d+)", hr, re.I)
+            size_mb = int(mm.group(1)) // (1024 * 1024) if mm else None
+        except Exception:
+            size_mb = None
+        size_hint = f"（约 {size_mb}MB，1080p）" if size_mb else "（1080p）"
+        progress(f"✅ 解析成功：{author_name} @{author_handle}\n⬇️ 开始下载{size_hint}…")
+        download_url(best_url, tmp)
+        actual_mb = os.path.getsize(tmp) // (1024 * 1024)
+        parts = split_video(tmp)
+        total = len(parts)
+        if total > 1:
+            progress(f"✅ 下载完成（{actual_mb}MB），超过 2GB，切成 {total} 段上传…")
+        else:
+            progress(f"✅ 下载完成（{actual_mb}MB），正在转发到群里…")
+        ok_all = True
+        for i, p in enumerate(parts):
+            if total > 1:
+                progress(f"📤 正在上传第 {i+1}/{total} 段…")
+            part_label = f"{i+1}/{total}" if total > 1 else None
+            caption = build_x_caption(tweet_url, text or "X视频", author_name,
+                                      author_handle, part_label)
+            if not send_video_file(p, caption):
+                ok_all = False
+        if ok_all:
+            progress(f"🎉 转发完成，共 {total} 段，已发到群里")
+        else:
+            progress(f"❌ 转发失败，请检查日志")
+        print(f"X video {tweet_id} -> group {'ok' if ok_all else 'FAILED'} "
+              f"({total} part(s))", flush=True)
+        return True
+    except Exception as e:
+        print(f"X link handling failed for {tweet_url}: {e}", flush=True)
+        progress(f"❌ 处理失败：{tweet_url}\n原因：{e}")
+        return True
+    finally:
+        for f in os.listdir(DATA_DIR):
+            if f.startswith(f"x_{msg_id}_{tweet_id}"):
+                try:
+                    os.remove(os.path.join(DATA_DIR, f))
+                except OSError:
+                    pass
+
+
 def handle_message(msg):
     frm = msg.get("from", {})
     username = (frm.get("username") or "").lower()
@@ -160,6 +339,13 @@ def handle_message(msg):
     if not fwd_sender and msg.get("forward_from"):
         f = msg["forward_from"]
         fwd_sender = f.get("first_name", "") + (" " + f.get("last_name", "") if f.get("last_name") else "")
+
+    # X link? download the video and post it directly (no Muse involved)
+    text = msg.get("text") or msg.get("caption") or ""
+    xm = X_URL_RE.search(text)
+    if xm and not fwd_chat:
+        handle_x_link(xm.group(0), msg["message_id"], msg["chat"]["id"])
+        return
 
     caption = build_caption(msg, fwd_chat, fwd_msg_id, fwd_sender)
     tmp = os.path.join(DATA_DIR, f"fwd_{msg['message_id']}")
@@ -234,13 +420,16 @@ def handle_message(msg):
 def main():
     print(f"tgforward started, allowed users: {sorted(ALLOWED)}", flush=True)
     offset = get_offset()
+    backoff = 5
     while True:
         try:
             r = api("getUpdates", {"offset": offset, "timeout": 50}, timeout=70)
             if not r.get("ok"):
                 print(f"getUpdates error: {r}", flush=True)
-                time.sleep(5)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
                 continue
+            backoff = 5  # reset on success
             for upd in r["result"]:
                 offset = upd["update_id"] + 1
                 save_offset(offset)
@@ -248,8 +437,12 @@ def main():
                 if msg:
                     handle_message(msg)
         except Exception as e:
+            err = str(e)
             print(f"poll error: {e}", flush=True)
-            time.sleep(5)
+            # 409 Conflict or 429: back off harder
+            if "409" in err or "429" in err:
+                backoff = min(backoff * 2, 120)
+            time.sleep(backoff)
 
 
 if __name__ == "__main__":
