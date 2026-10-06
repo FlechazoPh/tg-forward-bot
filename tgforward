@@ -426,6 +426,8 @@ def send_video_file(path, caption, user_chat_id=None, progress_msg_id=None,
             f"已上传 {up_bytes/(1024*1024):.1f}MB · 速度：{speed}　剩余：{eta}"))
         r = api_upload_with_progress("sendVideo", params, files, cb, timeout=1800)
         if r.get("ok"):
+            mid = (r.get("result") or {}).get("message_id")
+            print(f"sendVideo ok, message_id={mid}", flush=True)
             return True
         desc = str(r.get("description", ""))
         ra = (r.get("parameters") or {}).get("retry_after")
@@ -800,11 +802,15 @@ def main():
                 continue
             backoff = 5  # reset on success
             for upd in r["result"]:
-                offset = upd["update_id"] + 1
-                save_offset(offset)
                 msg = upd.get("message")
                 if msg:
-                    handle_message(msg)
+                    try:
+                        handle_message(msg)
+                    except Exception as e:
+                        print(f"handle_message failed: {e}", flush=True)
+                # save offset AFTER processing (avoid losing messages on crash)
+                offset = upd["update_id"] + 1
+                save_offset(offset)
         except Exception as e:
             err = str(e)
             print(f"poll error: {e}", flush=True)
