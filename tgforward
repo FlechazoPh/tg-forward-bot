@@ -44,7 +44,7 @@ QUEUE_FILE = os.path.join(DIR, "data", "x_queue.json")
 # Jobs are processed by a background worker thread. Queue persists to disk
 # so pending jobs survive restarts. Downloads use curl -C - (resume).
 x_queue = queue.Queue()
-queue_lock = threading.Lock()
+queue_lock = threading.RLock()
 active_job = None  # currently processing job info
 
 def load_queue():
@@ -541,10 +541,16 @@ def queue_x_job(url, msg_id, user_chat_id):
 def x_worker():
     """Background worker: processes X download jobs from the queue."""
     global active_job
+    print("x_worker: thread started", flush=True)
     while True:
         try:
             job = x_queue.get(timeout=5)
+            print(f"x_worker: got job {job['tweet_id']}", flush=True)
         except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"x_worker: get failed: {e}", flush=True)
+            time.sleep(1)
             continue
         with queue_lock:
             active_job = job
