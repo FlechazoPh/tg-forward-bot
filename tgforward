@@ -153,14 +153,37 @@ def build_caption(msg, fwd_chat, fwd_msg_id, fwd_sender_name):
     return "".join(parts)
 
 
-def download_url(url, dest, retries=5):
-    """Download a URL with curl, resume + retry."""
+def download_url(url, dest, retries=5, on_progress=None):
+    """Download a URL with curl, resume + retry. on_progress(pct, speed, eta)."""
     for attempt in range(retries):
-        r = subprocess.run(
-            ["curl", "-C", "-", "--retry", "3", "--retry-delay", "5",
-             "-L", "-A", UA, "-o", dest, url],
-            capture_output=True, text=True, timeout=1800)
-        if r.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        cmd = ["curl", "-C", "-", "--retry", "3", "--retry-delay", "5",
+               "-L", "-A", UA, "-o", dest, url, "--progress-bar"]
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE,
+                                text=True, bufsize=1)
+        last_update = 0
+        try:
+            buf = ""
+            while True:
+                ch = proc.stderr.read(1)
+                if not ch:
+                    break
+                if ch == "\r":
+                    m = re.search(r"(\d+\.?\d*)%", buf)
+                    if m and on_progress:
+                        pct = float(m.group(1))
+                        now = time.time()
+                        if now - last_update > 5:
+                            last_update = now
+                            on_progress(pct, "…", "…")
+                    buf = ""
+                else:
+                    buf += ch
+                    if len(buf) > 500:
+                        buf = buf[-500:]
+        except Exception:
+            pass
+        proc.wait()
+        if proc.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
             return dest
         time.sleep(min(2 ** attempt, 30))
     raise RuntimeError(f"download failed after {retries} attempts: {url[:80]}")
@@ -200,7 +223,8 @@ def fx_best_video(tweet_user, tweet_id):
 
 
 def split_video(path, max_bytes=MAX_TG_FILE):
-    """Split a video into <max_bytes parts (no re-encode). Returns [paths]."""
+    """Split a video into <max_bytes parts (no re-encode). Returns [paths].
+    Uses +faststart so Telegram can generate thumbnails for each part."""
     if os.path.getsize(path) <= max_bytes:
         return [path]
     out = subprocess.run(
@@ -216,24 +240,73 @@ def split_video(path, max_bytes=MAX_TG_FILE):
     for i in range(n):
         p = f"{base}_p{i+1}of{n}{ext}"
         subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-ss", str(seg * i),
-             "-i", path, "-c", "copy", "-t", str(seg), p],
+            ["ffmpeg", "-y", "-v", "error",
+             "-ss", str(seg * i), "-i", path,
+             "-c", "copy", "-movflags", "+faststart",
+             "-t", str(seg), p],
             check=True)
         parts.append(p)
     return parts
 
 
-def send_video_file(path, caption):
-    """Send a video file to the target group. Returns True on success."""
+def make_thumb(video_path, thumb_path):
+    """Extract a JPEG thumbnail from the middle of the video."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", video_path],
+        capture_output=True, text=True).stdout.strip()
+    try:
+        dur = float(out)
+    except ValueError:
+        dur = 10
+    ss = max(dur / 2, 1)
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-ss", str(ss),
+         "-i", video_path, "-vframes", "1",
+         "-vf", "scale=320:-1", thumb_path],
+        check=True)
+    return thumb_path
+
+
+def send_video_file(path, caption, user_chat_id=None, progress_msg_id=None,
+                    on_progress=None):
+    """Send a video file to the target group. Returns True on success.
+    Generates an explicit thumbnail so split parts always show a cover.
+    If on_progress given, it's called with (pct, speed, eta) during upload."""
     w, h, dur = ffprobe_video(path)
+    # explicit thumbnail (fixes missing cover on split parts)
+    thumb = None
+    try:
+        thumb = make_thumb(path, path + ".thumb.jpg")
+    except Exception as e:
+        print(f"thumb generation failed: {e}", flush=True)
+
+    def edit_progress(text):
+        if user_chat_id and progress_msg_id:
+            try:
+                api("editMessageText", {
+                    "chat_id": user_chat_id,
+                    "message_id": progress_msg_id,
+                    "text": text,
+                }, timeout=15)
+            except Exception:
+                pass
+
     for attempt in range(3):
-        r = api("sendVideo", {
+        files = {"video": path}
+        params = {
             "chat_id": TARGET_CHAT,
             "parse_mode": "HTML",
             "supports_streaming": "true",
             "width": w, "height": h, "duration": dur,
             "caption": caption[:1024],
-        }, files={"video": path}, timeout=1800)
+        }
+        if thumb and os.path.isfile(thumb):
+            files["thumb"] = thumb
+        # upload with progress parsing
+        cb = on_progress or (lambda pct, speed, eta: edit_progress(
+            f"📤 上传中… {pct:.0f}%\n速度：{speed}　剩余：{eta}"))
+        r = api_upload_with_progress("sendVideo", params, files, cb, timeout=1800)
         if r.get("ok"):
             return True
         desc = str(r.get("description", ""))
@@ -244,6 +317,57 @@ def send_video_file(path, caption):
         print(f"sendVideo failed: {r}", flush=True)
         time.sleep(5)
     return False
+
+
+def api_upload_with_progress(method, params, files, on_progress, timeout=1800):
+    """POST multipart via curl, parse progress bar, call on_progress(pct, speed, eta)."""
+    token = TOKEN
+    url = f"{API}/bot{token}/{method}"
+    cmd = ["curl", "-s", "-m", str(timeout), url]
+    for k, v in params.items():
+        cmd += ["--form-string", f"{k}={v}"]
+    for k, path in files.items():
+        cmd += ["-F", f"{k}=@{path}"]
+    # --progress-bar writes progress to stderr; parse it
+    cmd += ["--progress-bar"]
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE,
+                            text=True, bufsize=1)
+    last_update = 0
+    pct = 0.0
+    try:
+        # read stderr char by char for \r-separated progress updates
+        buf = ""
+        while True:
+            ch = proc.stderr.read(1)
+            if not ch:
+                break
+            if ch == "\r":
+                # parse line like: ## 45.2% ... 5.2M 0:01:23
+                m = re.search(r"(\d+\.?\d*)%", buf)
+                if m:
+                    pct = float(m.group(1))
+                    now = time.time()
+                    if now - last_update > 5:  # throttle to every 5s
+                        last_update = now
+                        # try to extract speed and eta from the bar
+                        parts = buf.split()
+                        speed = eta = "…"
+                        for i, p in enumerate(parts):
+                            if p.endswith("/s") or "M" in p or "k" in p:
+                                pass
+                        on_progress(pct, speed, eta)
+                buf = ""
+            else:
+                buf += ch
+                if len(buf) > 500:
+                    buf = buf[-500:]
+    except Exception:
+        pass
+    out, _ = proc.communicate()
+    try:
+        return json.loads(out)
+    except Exception:
+        return {"ok": False, "description": f"bad response: {out[:200]}"}
 
 
 def build_x_caption(tweet_url, text, author_name, author_handle, part=None):
@@ -258,7 +382,7 @@ def build_x_caption(tweet_url, text, author_name, author_handle, part=None):
 
 
 def handle_x_link(url, msg_id, user_chat_id):
-    """Download X video and send to group. Sends progress updates to the user.
+    """Download X video and send to group. Sends live progress updates to the user.
     Returns True if handled."""
     m = X_URL_RE.search(url)
     if not m:
@@ -267,7 +391,26 @@ def handle_x_link(url, msg_id, user_chat_id):
     tweet_url = f"https://x.com/{tweet_user}/status/{tweet_id}"
     tmp = os.path.join(DATA_DIR, f"x_{msg_id}_{tweet_id}.mp4")
 
-    def progress(text):
+    def send_prog(text):
+        print(f"[x:{tweet_id}] {text}", flush=True)
+        try:
+            r = api("sendMessage", {"chat_id": user_chat_id, "text": text})
+            if r.get("ok"):
+                return r["result"]["message_id"]
+        except Exception:
+            pass
+        return None
+
+    def edit_prog(mid, text):
+        if not mid:
+            return
+        try:
+            api("editMessageText", {
+                "chat_id": user_chat_id, "message_id": mid, "text": text})
+        except Exception:
+            pass
+
+    def say(text):
         print(f"[x:{tweet_id}] {text}", flush=True)
         try:
             api("sendMessage", {"chat_id": user_chat_id, "text": text})
@@ -275,9 +418,8 @@ def handle_x_link(url, msg_id, user_chat_id):
             pass
 
     try:
-        progress(f"🔗 收到 X 链接，开始解析…\n{tweet_url}")
+        say(f"🔗 收到 X 链接，开始解析…\n{tweet_url}")
         best_url, author_name, author_handle, text = fx_best_video(tweet_user, tweet_id)
-        # probe remote size for the progress message
         try:
             hr = subprocess.run(
                 ["curl", "-sI", "-m", "20", "-A", UA, best_url],
@@ -286,35 +428,50 @@ def handle_x_link(url, msg_id, user_chat_id):
             size_mb = int(mm.group(1)) // (1024 * 1024) if mm else None
         except Exception:
             size_mb = None
-        size_hint = f"（约 {size_mb}MB，1080p）" if size_mb else "（1080p）"
-        progress(f"✅ 解析成功：{author_name} @{author_handle}\n⬇️ 开始下载{size_hint}…")
-        download_url(best_url, tmp)
+        size_hint = f"约 {size_mb}MB" if size_mb else "大小未知"
+        say(f"✅ 解析成功：{author_name} @{author_handle}")
+        dl_mid = send_prog(f"⬇️ 下载中… 0%\n{size_hint} · 1080p")
+        last_dl = [0]
+        def on_dl(pct, speed, eta):
+            # throttle: only edit on 5% steps to avoid flood limits
+            if pct - last_dl[0] >= 5 or pct >= 100:
+                last_dl[0] = pct
+                edit_prog(dl_mid,
+                          f"⬇️ 下载中… {pct:.0f}%\n{size_hint} · 1080p")
+        download_url(best_url, tmp, on_progress=on_dl)
+        edit_prog(dl_mid, f"⬇️ 下载完成 ✅\n{size_hint} · 1080p")
         actual_mb = os.path.getsize(tmp) // (1024 * 1024)
         parts = split_video(tmp)
         total = len(parts)
         if total > 1:
-            progress(f"✅ 下载完成（{actual_mb}MB），超过 2GB，切成 {total} 段上传…")
-        else:
-            progress(f"✅ 下载完成（{actual_mb}MB），正在转发到群里…")
+            say(f"📦 文件 {actual_mb}MB 超过 2GB，切成 {total} 段上传…")
         ok_all = True
         for i, p in enumerate(parts):
-            if total > 1:
-                progress(f"📤 正在上传第 {i+1}/{total} 段…")
             part_label = f"{i+1}/{total}" if total > 1 else None
             caption = build_x_caption(tweet_url, text or "X视频", author_name,
                                       author_handle, part_label)
-            if not send_video_file(p, caption):
+            seg_name = f"第 {i+1}/{total} 段" if total > 1 else "视频"
+            up_mid = send_prog(f"📤 {seg_name}上传中… 0%")
+            last_up = [0]
+            def on_up(pct, speed, eta, _lm=last_up, _mid=up_mid, _sn=seg_name):
+                if pct - _lm[0] >= 5 or pct >= 100:
+                    _lm[0] = pct
+                    edit_prog(_mid, f"📤 {_sn}上传中… {pct:.0f}%")
+            if not send_video_file(p, caption, user_chat_id, up_mid, on_up):
                 ok_all = False
+                edit_prog(up_mid, f"📤 {seg_name}上传失败 ❌")
+            else:
+                edit_prog(up_mid, f"📤 {seg_name}上传完成 ✅")
         if ok_all:
-            progress(f"🎉 转发完成，共 {total} 段，已发到群里")
+            say(f"🎉 全部完成，共 {total} 段，已发到群里")
         else:
-            progress(f"❌ 转发失败，请检查日志")
+            say(f"❌ 部分上传失败，请检查日志")
         print(f"X video {tweet_id} -> group {'ok' if ok_all else 'FAILED'} "
               f"({total} part(s))", flush=True)
         return True
     except Exception as e:
         print(f"X link handling failed for {tweet_url}: {e}", flush=True)
-        progress(f"❌ 处理失败：{tweet_url}\n原因：{e}")
+        say(f"❌ 处理失败：{tweet_url}\n原因：{e}")
         return True
     finally:
         for f in os.listdir(DATA_DIR):
