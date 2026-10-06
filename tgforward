@@ -445,6 +445,47 @@ def send_video_file(path, caption, user_chat_id=None, progress_msg_id=None,
     return False
 
 
+def upload_video_get_file_id(path, user_chat_id, on_progress=None):
+    """Upload video to user's private chat, return (file_id, w, h, dur).
+    The message is deleted immediately; file_id is reused for sendMediaGroup.
+    Returns (None, 0, 0, 0) on failure."""
+    w, h, dur = ffprobe_video(path)
+    thumb = None
+    try:
+        thumb = make_thumb(path, path + ".thumb.jpg")
+    except Exception as e:
+        print(f"thumb generation failed: {e}", flush=True)
+
+    for attempt in range(3):
+        files = {"video": path}
+        params = {
+            "chat_id": user_chat_id,
+            "supports_streaming": "true",
+            "width": w, "height": h, "duration": dur,
+        }
+        if thumb and os.path.isfile(thumb):
+            files["thumb"] = thumb
+        cb = on_progress or (lambda pct, speed, eta, up_bytes=0, heartbeat=None: None)
+        r = api_upload_with_progress("sendVideo", params, files, cb, timeout=1800)
+        if r.get("ok"):
+            result = r.get("result") or {}
+            vid = result.get("video") or {}
+            file_id = vid.get("file_id")
+            mid = result.get("message_id")
+            # delete the temp message from private chat
+            if mid:
+                try:
+                    api("deleteMessage", {"chat_id": user_chat_id, "message_id": mid})
+                except Exception:
+                    pass
+            if file_id:
+                print(f"upload ok, file_id={file_id[:20]}...", flush=True)
+                return file_id, w, h, dur
+        print(f"upload failed (attempt {attempt+1}): {r}", flush=True)
+        time.sleep(5)
+    return None, 0, 0, 0
+
+
 def api_upload_with_progress(method, params, files, on_progress, timeout=1800):
     """POST multipart via curl, parse progress bar.
     on_progress(pct, speed, eta, uploaded_bytes).
@@ -691,34 +732,82 @@ def process_x_job(url, msg_id, user_chat_id, tweet_user, tweet_id):
         parts = split_video(tmp)
         total = len(parts)
         if total > 1:
-            say(f"📦 文件 {actual_mb}MB 超过 2GB，切成 {total} 段上传…")
+            say(f"📦 文件 {actual_mb}MB 超过阈值，切成 {total} 段上传…")
         ok_all = True
-        for i, p in enumerate(parts):
-            part_label = f"{i+1}/{total}" if total > 1 else None
+        if total == 1:
+            # Single part: send directly as before
+            p = parts[0]
             caption = build_x_caption(tweet_url, text or "X视频", author_name,
-                                      author_handle, part_label)
-            seg_name = f"第 {i+1}/{total} 段" if total > 1 else "视频"
-            up_mid = send_prog(f"📤 {seg_name}上传中 (1/2: 传到服务器)…\n{progress_bar(0)}")
-            def on_up(pct, speed, eta, up_bytes=0, _mid=up_mid, _sn=seg_name,
+                                      author_handle, None)
+            up_mid = send_prog(f"📤 视频上传中 (1/2: 传到服务器)…\n{progress_bar(0)}")
+            def on_up(pct, speed, eta, up_bytes=0, _mid=up_mid,
                      heartbeat=None):
-                # phase 1: curl to local API (real progress)
-                # phase 2: API to Telegram (estimated progress via heartbeat)
                 if heartbeat:
-                    # heartbeat already contains full formatted message
                     edit_prog(_mid, heartbeat)
                     return
                 up_mb = up_bytes / (1024*1024)
                 edit_prog(_mid,
-                          f"📤 {_sn}上传中 (1/2: 传到服务器)…\n{progress_bar(pct)}\n"
+                          f"📤 视频上传中 (1/2: 传到服务器)…\n{progress_bar(pct)}\n"
                           f"已上传 {up_mb:.1f}MB · 速度：{speed}　剩余：{eta}")
             if not send_video_file(p, caption, user_chat_id, up_mid, on_up):
                 ok_all = False
-                edit_prog(up_mid, f"📤 {seg_name}上传失败 ❌")
+                edit_prog(up_mid, f"📤 视频上传失败 ❌")
             else:
-                edit_prog(up_mid, f"📤 {seg_name}上传完成 ✅")
-        if ok_all:
-            say(f"🎉 全部完成，共 {total} 段，已发到群里")
+                edit_prog(up_mid, f"📤 视频上传完成 ✅")
         else:
+            # Multi-part: upload each to get file_id, then sendMediaGroup as album
+            file_ids = []
+            for i, p in enumerate(parts):
+                seg_name = f"第 {i+1}/{total} 段"
+                up_mid = send_prog(f"📤 {seg_name}上传中 (1/2: 传到服务器)…\n{progress_bar(0)}")
+                def on_up(pct, speed, eta, up_bytes=0, _mid=up_mid, _sn=seg_name,
+                         heartbeat=None):
+                    if heartbeat:
+                        edit_prog(_mid, heartbeat)
+                        return
+                    up_mb = up_bytes / (1024*1024)
+                    edit_prog(_mid,
+                              f"📤 {_sn}上传中 (1/2: 传到服务器)…\n{progress_bar(pct)}\n"
+                              f"已上传 {up_mb:.1f}MB · 速度：{speed}　剩余：{eta}")
+                fid, w, h, dur = upload_video_get_file_id(p, user_chat_id, on_up)
+                if not fid:
+                    ok_all = False
+                    edit_prog(up_mid, f"📤 {seg_name}上传失败 ❌")
+                    break
+                file_ids.append((fid, w, h, dur))
+                edit_prog(up_mid, f"📤 {seg_name}上传完成 ✅")
+            if ok_all and file_ids:
+                # Send as a single media group (album)
+                caption = build_x_caption(tweet_url, text or "X视频", author_name,
+                                          author_handle, None)
+                media = []
+                for idx, (fid, w, h, dur) in enumerate(file_ids):
+                    item = {
+                        "type": "video",
+                        "media": fid,
+                        "supports_streaming": True,
+                        "width": w, "height": h, "duration": dur,
+                    }
+                    if idx == 0:
+                        item["caption"] = caption[:1024]
+                        item["parse_mode"] = "HTML"
+                    media.append(item)
+                try:
+                    r = api("sendMediaGroup", {
+                        "chat_id": TARGET_CHAT,
+                        "media": json.dumps(media),
+                    }, timeout=120)
+                    if r.get("ok"):
+                        say(f"🎉 全部完成，共 {total} 段，已合成一条相册消息发到群里")
+                    else:
+                        ok_all = False
+                        say(f"❌ 相册发送失败：{r.get('description')}")
+                except Exception as e:
+                    ok_all = False
+                    say(f"❌ 相册发送失败：{e}")
+        if total == 1 and ok_all:
+            say(f"🎉 全部完成，已发到群里")
+        elif total > 1 and not ok_all:
             say(f"❌ 部分上传失败，请检查日志")
         print(f"X video {tweet_id} -> group {'ok' if ok_all else 'FAILED'} "
               f"({total} part(s))", flush=True)
