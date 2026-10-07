@@ -25,7 +25,7 @@ import time
 import urllib.request
 import urllib.parse
 
-DIR = "/home/hatch/workspace/tools/tgapi"
+DIR = "/home/ubuntu/workspace/tools/tgapi"
 API = "http://127.0.0.1:8081"
 DATA_DIR = os.path.join(DIR, "data", "forward")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -873,19 +873,34 @@ def handle_message(msg):
     caption = build_caption(msg, fwd_chat, fwd_msg_id, fwd_sender)
     tmp = os.path.join(DATA_DIR, f"fwd_{msg['message_id']}")
 
+    # notify user that forward started (Fix 1: progress feedback)
+    try:
+        api("sendMessage", {"chat_id": msg["chat"]["id"],
+            "text": "🔄 收到转发消息，正在处理…"})
+    except Exception:
+        pass
     try:
         if "video" in msg:
             v = msg["video"]
             dest = tmp + ".mp4"
             download_file(v["file_id"], dest)
             w, h, dur = ffprobe_video(dest)
+            # Fix 2: generate thumbnail so group message has cover
+            thumb = None
+            try:
+                thumb = make_thumb(dest, dest + ".thumb.jpg")
+            except Exception:
+                pass
+            _files = {"video": dest}
+            if thumb and os.path.isfile(thumb):
+                _files["thumb"] = thumb
             r = api("sendVideo", {
                 "chat_id": TARGET_CHAT,
                 "parse_mode": "HTML",
                 "supports_streaming": "true",
                 "width": w, "height": h, "duration": dur,
                 "caption": caption[:1024],
-            }, files={"video": dest}, timeout=1800)
+            }, files=_files, timeout=1800)
         elif "photo" in msg:
             p = msg["photo"][-1]  # largest
             dest = tmp + ".jpg"
@@ -926,8 +941,18 @@ def handle_message(msg):
 
         if r.get("ok"):
             print(f"forwarded msg {msg['message_id']} -> group ok", flush=True)
+            try:
+                api("sendMessage", {"chat_id": msg["chat"]["id"],
+                    "text": "✅ 已转发到群"})
+            except Exception:
+                pass
         else:
             print(f"send failed: {r}", flush=True)
+            try:
+                api("sendMessage", {"chat_id": msg["chat"]["id"],
+                    "text": f"❌ 转发失败：{r.get('description', '未知错误')}"})
+            except Exception:
+                pass
     except Exception as e:
         print(f"error handling msg {msg.get('message_id')}: {e}", flush=True)
     finally:
