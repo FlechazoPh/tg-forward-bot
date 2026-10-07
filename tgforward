@@ -792,13 +792,34 @@ def process_x_job(url, msg_id, user_chat_id, tweet_user, tweet_id):
                         item["caption"] = caption[:1024]
                         item["parse_mode"] = "HTML"
                     media.append(item)
+                # Wait for Telegram to finish processing uploaded videos
+                # (file_id usable immediately, but media group needs processing done)
+                time.sleep(10)
                 try:
                     r = api("sendMediaGroup", {
                         "chat_id": TARGET_CHAT,
                         "media": json.dumps(media),
                     }, timeout=120)
-                    if r.get("ok"):
+                    sent_count = len(r.get("result", [])) if r.get("ok") else 0
+                    if r.get("ok") and sent_count == total:
                         say(f"🎉 全部完成，共 {total} 段，已合成一条相册消息发到群里")
+                    elif r.get("ok"):
+                        # Partial: some videos missing, fall back to individual sends
+                        print(f"media group partial: {sent_count}/{total}, fallback to individual", flush=True)
+                        for idx, (fid, w, h, dur) in enumerate(file_ids):
+                            cap = caption[:1024] if idx == 0 else f"第 {idx+1}/{total} 段"
+                            rr = api("sendVideo", {
+                                "chat_id": TARGET_CHAT,
+                                "video": fid,
+                                "parse_mode": "HTML",
+                                "supports_streaming": True,
+                                "width": w, "height": h, "duration": dur,
+                                "caption": cap,
+                            }, timeout=120)
+                            if not rr.get("ok"):
+                                ok_all = False
+                        if ok_all:
+                            say(f"🎉 全部完成，共 {total} 段，已逐段发到群里")
                     else:
                         ok_all = False
                         say(f"❌ 相册发送失败：{r.get('description')}")
