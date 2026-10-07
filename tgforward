@@ -523,7 +523,7 @@ def api_upload_with_progress(method, params, files, on_progress, timeout=1800):
                 if m:
                     pct = float(m.group(1))
                     now = time.time()
-                    if now - last_update > 5:  # throttle to every 5s
+                    if now - last_update > 1:  # throttle to every 1s
                         last_update = now
                         # try to extract speed (e.g. "5.2M/s", "823k/s") and ETA
                         # from curl progress bar
